@@ -1,0 +1,37 @@
+# Use this file after building the image once with: docker compose build
+# Run with: docker compose -f docker-compose-nobuild.yml up -d
+
+services:
+  gemini-proxy:
+    image: gemini-rotation-proxy:latest
+    container_name: gemini-rotation-proxy
+    restart: unless-stopped
+    ports:
+      - "1237:1237"
+    volumes:
+      # Mount config directory (keys.txt, keys_failed.txt)
+      - ./config_d:/app/config_d
+      # Mount log directory
+      - ./log_d:/app/log_d
+    environment:
+      # Max rotation attempts (default: 7)
+      - MAX_ROTATION_TIMES=7
+      # Model name (default: gemini-2.5-flash)
+      - MODEL=gemini-2.5-flash
+      # Gemini API base URL
+      - GEMINI_URL=https://generativelanguage.googleapis.com
+      # Enable streaming mode (default: false)
+      - GEMINI_STREAMING=false
+      # Enable raw format mode (default: false)
+      - GEMINI_RAW_FORMAT=false
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:1237/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,0 +1,482 @@
+#!/usr/bin/env python3
+"""
+Gemini API Key Rotation Proxy
+- Rotates through multiple API keys
+- Logs failed keys with error info
+- Supports streaming and raw format modes
+- Password authentication support
+"""
+
+import os
+import random
+import asyncio
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+import httpx
+from fastapi import FastAPI, Request, HTTPException, Depends, Header
+from fastapi.responses import StreamingResponse, JSONResponse
+import secrets
+import logging
+from logging.handlers import RotatingFileHandler
+
+# Configuration
+CONFIG_DIR = Path("/app/config_d")
+LOG_DIR = Path("/app/log_d")
+KEYS_FILE = CONFIG_DIR / "keys.txt"
+KEYS_FAILED_FILE = CONFIG_DIR / "keys_failed.txt"
+
+# Ensure log directory exists
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+# Configure logging with file handler
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        RotatingFileHandler(
+            LOG_DIR / "proxy.log",
+            maxBytes=10 * 1024 * 1024,  # 10MB
+            backupCount=5,
+        ),
+    ],
+)
+logger = logging.getLogger(__name__)
+
+# Environment variables with defaults
+MAX_ROTATION_TIMES = int(os.getenv("MAX_ROTATION_TIMES", "7"))
+MODEL = os.getenv("MODEL", "gemini-2.5-flash")
+GEMINI_URL = os.getenv("GEMINI_URL", "https://generativelanguage.googleapis.com")
+GEMINI_STREAMING = os.getenv("GEMINI_STREAMING", "false").lower() == "true"
+GEMINI_RAW_FORMAT = os.getenv("GEMINI_RAW_FORMAT", "false").lower() == "true"
+
+# Authentication
+AUTH_PASSWORD = os.getenv("AUTH_PASSWORD", "")  # Empty = no auth required
+
+
+class KeyManager:
+    """Manages API keys with rotation and failure tracking."""
+
+    def __init__(self):
+        self.keys: list[str] = []
+        self.current_index: int = 0
+        self.lock = asyncio.Lock()
+        self._load_keys()
+
+    def _load_keys(self):
+        """Load keys from file and shuffle randomly."""
+        if not KEYS_FILE.exists():
+            logger.error(f"Keys file not found: {KEYS_FILE}")
+            return
+
+        with open(KEYS_FILE, "r") as f:
+            self.keys = [
+                line.strip()
+                for line in f
+                if line.strip() and not line.strip().startswith("#")
+            ]
+
+        # Shuffle randomly on init
+        random.shuffle(self.keys)
+        logger.info(f"Loaded {len(self.keys)} keys (shuffled)")
+
+    async def get_next_key(self) -> Optional[str]:
+        """Get next key in rotation."""
+        async with self.lock:
+            if not self.keys:
+                return None
+            key = self.keys[self.current_index]
+            self.current_index = (self.current_index + 1) % len(self.keys)
+            return key
+
+    async def log_failed_key(self, key: str, error: str):
+        """Log failed key to keys_failed.txt."""
+        async with self.lock:
+            timestamp = datetime.now().isoformat()
+            # Mask key for logging (show first 8 and last 4 chars)
+            masked_key = f"{key[:8]}...{key[-4:]}" if len(key) > 12 else key
+            log_entry = f"{key} # {error} # {timestamp}\n"
+
+            with open(KEYS_FAILED_FILE, "a") as f:
+                f.write(log_entry)
+
+            logger.warning(f"Key failed: {masked_key} - {error}")
+
+
+# Initialize
+app = FastAPI(title="Gemini Rotation Proxy")
+key_manager = KeyManager()
+
+
+# ============================================================
+# Authentication
+# ============================================================
+
+
+async def verify_auth(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    """Verify authentication if AUTH_PASSWORD is set."""
+    if not AUTH_PASSWORD:
+        # No password configured, allow all requests
+        return True
+
+    # Check Authorization header: Bearer <password>
+    if authorization:
+        if authorization.startswith("Bearer "):
+            token = authorization[7:]
+            if secrets.compare_digest(token, AUTH_PASSWORD):
+                return True
+
+    # Check query parameter: ?password=<password>
+    password_param = request.query_params.get("password")
+    if password_param and secrets.compare_digest(password_param, AUTH_PASSWORD):
+        return True
+
+    # Authentication failed
+    raise HTTPException(
+        status_code=401,
+        detail="Unauthorized. Provide password via 'Authorization: Bearer <password>' header or '?password=<password>' query param",
+    )
+
+
+# ============================================================
+# Simplified response format
+# ============================================================
+
+
+def simplify_gemini_response(raw_response: dict) -> dict:
+    """
+    Convert Gemini API response to simplified flat JSON.
+
+    Input (Gemini raw):
+    {
+        "candidates": [{
+            "content": {
+                "parts": [{"text": "Hello!"}],
+                "role": "model"
+            },
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": {...},
+        "modelVersion": "gemini-2.5-flash"
+    }
+
+    Output (simplified):
+    {
+        "text": "Hello!",
+        "finish_reason": "STOP",
+        "model": "gemini-2.5-flash",
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+        "total_tokens": 15
+    }
+    """
+    try:
+        # Extract text from candidates
+        text = ""
+        finish_reason = ""
+
+        candidates = raw_response.get("candidates", [])
+        if candidates:
+            candidate = candidates[0]
+            finish_reason = candidate.get("finishReason", "")
+            content = candidate.get("content", {})
+            parts = content.get("parts", [])
+
+            # Concatenate all text parts
+            text_parts = []
+            for part in parts:
+                if "text" in part:
+                    text_parts.append(part["text"])
+            text = "".join(text_parts)
+
+        # Extract usage metadata
+        usage = raw_response.get("usageMetadata", {})
+        prompt_tokens = usage.get("promptTokenCount", 0)
+        completion_tokens = usage.get("candidatesTokenCount", 0)
+        total_tokens = usage.get("totalTokenCount", 0)
+
+        # Model version
+        model = raw_response.get("modelVersion", "")
+
+        return {
+            "text": text,
+            "finish_reason": finish_reason,
+            "model": model,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        }
+    except Exception as e:
+        logger.error(f"Failed to simplify response: {e}")
+        # Return raw if simplification fails
+        return raw_response
+
+
+# ============================================================
+# Specific routes - MUST be defined BEFORE catch-all route
+# ============================================================
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint - no auth required."""
+    return {
+        "status": "healthy",
+        "keys_loaded": len(key_manager.keys),
+        "auth_enabled": bool(AUTH_PASSWORD),
+        "config": {
+            "max_rotation_times": MAX_ROTATION_TIMES,
+            "model": MODEL,
+            "gemini_url": GEMINI_URL,
+            "gemini_streaming": GEMINI_STREAMING,
+            "gemini_raw_format": GEMINI_RAW_FORMAT,
+        },
+    }
+
+
+@app.post("/reload-keys")
+async def reload_keys(_: bool = Depends(verify_auth)):
+    """Reload keys from file."""
+    key_manager._load_keys()
+    return {"status": "ok", "keys_loaded": len(key_manager.keys)}
+
+
+@app.get("/status")
+async def status(_: bool = Depends(verify_auth)):
+    """Status endpoint."""
+    return {
+        "status": "running",
+        "keys_available": len(key_manager.keys),
+        "current_index": key_manager.current_index,
+    }
+
+
+# ============================================================
+# Helper functions for proxying
+# ============================================================
+
+
+async def make_gemini_request(
+    client: httpx.AsyncClient,
+    api_key: str,
+    endpoint: str,
+    method: str,
+    body: Optional[dict],
+    headers: dict,
+    stream: bool = False,
+):
+    """Make request to Gemini API."""
+    # Build URL with API key
+    url = f"{GEMINI_URL}{endpoint}"
+    if "?" in url:
+        url = f"{url}&key={api_key}"
+    else:
+        url = f"{url}?key={api_key}"
+
+    # Remove host header to avoid conflicts
+    request_headers = {
+        k: v
+        for k, v in headers.items()
+        if k.lower() not in ["host", "content-length", "authorization"]
+    }
+
+    if stream:
+        # Streaming request
+        req = client.build_request(
+            method=method,
+            url=url,
+            json=body if body else None,
+            headers=request_headers,
+        )
+        response = await client.send(req, stream=True)
+        return response
+    else:
+        # Regular request
+        response = await client.request(
+            method=method,
+            url=url,
+            json=body if body else None,
+            headers=request_headers,
+            timeout=120.0,
+        )
+        return response
+
+
+async def stream_response(response: httpx.Response):
+    """Stream response content."""
+    try:
+        async for chunk in response.aiter_bytes():
+            yield chunk
+    finally:
+        await response.aclose()
+
+
+# ============================================================
+# Catch-all proxy route - MUST be defined LAST
+# ============================================================
+
+
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def proxy_request(request: Request, path: str, _: bool = Depends(verify_auth)):
+    """Proxy all requests to Gemini API with key rotation."""
+
+    # Parse request body if present
+    body = None
+    if request.method in ["POST", "PUT", "PATCH"]:
+        try:
+            body = await request.json()
+        except:
+            body = None
+
+    # Get headers
+    headers = dict(request.headers)
+
+    # Determine if streaming
+    use_streaming = GEMINI_STREAMING
+    if body and "stream" in str(body).lower():
+        use_streaming = True
+
+    # Build endpoint - filter out auth params
+    endpoint = f"/{path}"
+    if request.query_params:
+        # Filter out 'key', 'password' params
+        params = [
+            (k, v)
+            for k, v in request.query_params.items()
+            if k.lower() not in ["key", "password"]
+        ]
+        if params:
+            param_str = "&".join([f"{k}={v}" for k, v in params])
+            endpoint = f"{endpoint}?{param_str}"
+
+    # Try with key rotation
+    last_error = None
+    attempted_keys = set()
+
+    async with httpx.AsyncClient() as client:
+        for attempt in range(MAX_ROTATION_TIMES):
+            api_key = await key_manager.get_next_key()
+
+            if not api_key:
+                raise HTTPException(status_code=500, detail="No API keys available")
+
+            # Skip if already tried this key
+            if api_key in attempted_keys:
+                continue
+            attempted_keys.add(api_key)
+
+            try:
+                logger.info(
+                    f"Attempt {attempt + 1}/{MAX_ROTATION_TIMES} for {endpoint}"
+                )
+
+                if use_streaming:
+                    response = await make_gemini_request(
+                        client,
+                        api_key,
+                        endpoint,
+                        request.method,
+                        body,
+                        headers,
+                        stream=True,
+                    )
+
+                    if response.status_code == 200:
+                        # Streaming always returns raw format
+                        return StreamingResponse(
+                            stream_response(response),
+                            media_type=response.headers.get(
+                                "content-type", "application/json"
+                            ),
+                            headers={
+                                k: v
+                                for k, v in response.headers.items()
+                                if k.lower()
+                                not in [
+                                    "content-encoding",
+                                    "transfer-encoding",
+                                    "content-length",
+                                ]
+                            },
+                        )
+                    else:
+                        # Read error and close
+                        error_body = await response.aread()
+                        await response.aclose()
+                        error_text = error_body.decode("utf-8", errors="ignore")
+
+                        # Log failed key
+                        await key_manager.log_failed_key(
+                            api_key, f"HTTP {response.status_code}: {error_text[:200]}"
+                        )
+                        last_error = f"HTTP {response.status_code}: {error_text}"
+
+                        # If it's a rate limit or quota error, try next key
+                        if response.status_code in [429, 403, 401]:
+                            continue
+                        else:
+                            # For other errors, return immediately
+                            raise HTTPException(
+                                status_code=response.status_code, detail=error_text
+                            )
+                else:
+                    # Non-streaming request
+                    response = await make_gemini_request(
+                        client,
+                        api_key,
+                        endpoint,
+                        request.method,
+                        body,
+                        headers,
+                        stream=False,
+                    )
+
+                    if response.status_code == 200:
+                        raw_json = response.json()
+
+                        if GEMINI_RAW_FORMAT:
+                            # Raw format: return Gemini response as-is
+                            return JSONResponse(content=raw_json)
+                        else:
+                            # Simplified format: flat JSON
+                            simplified = simplify_gemini_response(raw_json)
+                            return JSONResponse(content=simplified)
+                    else:
+                        error_text = response.text
+
+                        # Log failed key
+                        await key_manager.log_failed_key(
+                            api_key, f"HTTP {response.status_code}: {error_text[:200]}"
+                        )
+                        last_error = f"HTTP {response.status_code}: {error_text}"
+
+                        # If it's a rate limit or quota error, try next key
+                        if response.status_code in [429, 403, 401]:
+                            continue
+                        else:
+                            raise HTTPException(
+                                status_code=response.status_code, detail=error_text
+                            )
+
+            except httpx.RequestError as e:
+                error_str = str(e)
+                await key_manager.log_failed_key(api_key, error_str)
+                last_error = error_str
+                logger.error(f"Request error: {error_str}")
+                continue
+
+    # All retries exhausted
+    raise HTTPException(
+        status_code=503,
+        detail=f"All {MAX_ROTATION_TIMES} rotation attempts failed. Last error: {last_error}",
+    )
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=1237)

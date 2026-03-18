@@ -1,0 +1,16 @@
+2025-12-27 09:44:04,603 - INFO - Loaded 20 keys (shuffled)
+2025-12-27 09:44:49,522 - INFO - Attempt 1/7 for /v1beta/models/gemini-2.5-flash:generateContent
+2025-12-27 09:44:51,855 - INFO - HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=AIzaSyCBYU1tvDofxcjluOElrPMLa9v7sJVhMIY "HTTP/1.1 200 OK"
+2025-12-27 09:59:21,276 - INFO - Loaded 20 keys (shuffled)
+2025-12-27 10:01:24,826 - INFO - Loaded 20 keys (shuffled)
+2025-12-27 10:01:43,850 - INFO - Attempt 1/7 for /v1beta/models/gemini-2.5-flash:generateContent
+2025-12-27 10:01:45,343 - INFO - HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=AIzaSyA4nnrY6sxI14a43NT4dutmrxM0gjWQh9Q "HTTP/1.1 200 OK"
+2025-12-29 01:18:51,525 - INFO - Attempt 1/7 for /v1beta/models/gemini-2.5-flash:generateContent
+2025-12-29 01:18:52,240 - INFO - HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=AIzaSyDPVQLBAGdZO_tukDWISO4qUseIwJ0i9a8 "HTTP/1.1 200 OK"
+2025-12-29 01:24:30,755 - INFO - Attempt 1/7 for /v1beta/models/gemini-2.5-flash-lite:generateContent
+2025-12-29 01:24:31,134 - INFO - HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=AIzaSyAPQRKuEeQMKxaCUgqZJklleNAg6CsbOi8 "HTTP/1.1 200 OK"
+2025-12-29 01:26:14,802 - INFO - Attempt 1/7 for /generateContent
+2025-12-29 01:26:14,881 - INFO - HTTP Request: POST https://generativelanguage.googleapis.com/generateContent?key=AIzaSyD4gLajPxBEhMjeaIuiA9ebS8sLVNJqy7c "HTTP/1.1 404 Not Found"
+2025-12-29 01:26:14,882 - WARNING - Key failed: AIzaSyD4...qy7c - HTTP 404: 
+2025-12-29 01:33:07,048 - INFO - Attempt 1/7 for /v1beta/models/gemini-2.5-flash-lite:generateContent
+2025-12-29 01:33:07,595 - INFO - HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=AIzaSyBDD-z2qxfwVR8eKl7hm6i9ljYjAE_WiwU "HTTP/1.1 200 OK"
